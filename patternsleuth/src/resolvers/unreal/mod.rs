@@ -240,7 +240,6 @@ pub mod util {
     derive(serde::Serialize, serde::Deserialize)
 )]
 pub struct ConsoleManagerSingleton(pub u64);
-
 impl_resolver_singleton!(all, ConsoleManagerSingleton, |ctx| async {
     let strings = join_all([
         ctx.scan(
