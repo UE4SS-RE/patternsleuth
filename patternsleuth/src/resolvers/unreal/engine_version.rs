@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt::{Debug, Display},
     str::FromStr,
 };
@@ -9,8 +10,8 @@ use itertools::Itertools;
 use patternsleuth_scanner::Pattern;
 
 use crate::{
-    MemoryTrait,
-    resolvers::{ResolveError, bail_out, impl_resolver, try_ensure_one},
+    Addressable as _, MemoryTrait,
+    resolvers::{ResolveError, bail_out, impl_resolver, impl_resolver_singleton, try_ensure_one},
 };
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -172,7 +173,7 @@ impl_resolver!(ElfImage, EngineVersionStrings, |ctx| async {
 });
 
 impl_resolver!(PEImage, EngineVersionStrings, |ctx| async {
-    use crate::{Addressable, MemoryTrait};
+    use crate::MemoryTrait;
     use std::collections::HashSet;
 
     let patterns = [
@@ -250,5 +251,236 @@ impl_resolver!(all, BuildConfiguration, |ctx| async {
     } else {
         // No debug string found - assume shipping build
         Ok(BuildConfiguration::Shipping)
+    }
+});
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde-resolvers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct CustomVersionRegistry(u64);
+impl_resolver_singleton!(all, CustomVersionRegistry, |ctx| async {
+    let patterns = [
+        "75 de 48 8d 1d | ?? ?? ?? ?? 48 8b cb ff 15 ?? ?? ?? ?? 66 0f 6f 05 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? 33 c0",
+    ];
+
+    let res = join_all(patterns.iter().map(|p| ctx.scan(Pattern::new(p).unwrap())))
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    Ok(Self(try_ensure_one(
+        res.into_iter().map(|a| Ok(ctx.image().memory.rip4(a)?)),
+    )?))
+});
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Guid([u8; 16]);
+
+impl std::fmt::Debug for Guid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        for (i, byte) in self.0.iter().enumerate() {
+            if i == 4 || i == 6 || i == 8 || i == 10 {
+                f.write_str("-")?;
+            }
+            write!(f, "{:02x}", byte)?;
+        }
+        write!(f, "}}")
+    }
+}
+
+#[cfg(feature = "serde-resolvers")]
+impl serde::Serialize for Guid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let hex_string = self
+            .0
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+
+        serializer.serialize_str(&hex_string)
+    }
+}
+
+#[cfg(feature = "serde-resolvers")]
+impl<'de> serde::Deserialize<'de> for Guid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct GuidVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for GuidVisitor {
+            type Value = Guid;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a hex string of 32 characters")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Guid, E>
+            where
+                E: serde::de::Error,
+            {
+                let clean = value.replace("-", "");
+
+                if clean.len() != 32 {
+                    return Err(E::custom(format!(
+                        "expected 32 hex characters, got {}",
+                        clean.len()
+                    )));
+                }
+
+                let mut bytes = [0u8; 16];
+                for i in 0..16 {
+                    let byte_str = &clean[i * 2..i * 2 + 2];
+                    bytes[i] =
+                        u8::from_str_radix(byte_str, 16).map_err(|_| E::custom("invalid GUID"))?;
+                }
+
+                Ok(Guid(bytes))
+            }
+        }
+
+        deserializer.deserialize_str(GuidVisitor)
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(
+    feature = "serde-resolvers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+struct CustomVersion {
+    guid: Guid,
+    version: u32,
+    name: String,
+}
+impl std::fmt::Debug for CustomVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CustomVersion({:?}, {:>3}, {})",
+            self.guid, self.version, self.name
+        )
+    }
+}
+
+impl FromStr for StaticCustomVersions {
+    type Err = ResolveError;
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde-resolvers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct StaticCustomVersions(BTreeSet<CustomVersion>);
+impl_resolver!(all, StaticCustomVersions, |ctx| async {
+    enum V {
+        A,
+        B,
+        C,
+        D,
+        E,
+        F,
+        G,
+    }
+    #[rustfmt::skip]
+    let patterns = [
+        (V::A, "0f 10 05 [ ?? ?? ?? ?? ] 45 33 c9 4c 8d 05 [ ?? ?? ?? ?? ] 48 8d 4c 24 20 0f 29 44 24 20 0f 11 05 ?? ?? ?? ?? 41 8d 51 [ ?? ] e8 [ ?? ?? ?? ?? ]"),
+        (V::A, "0f 10 35 [ ?? ?? ?? ?? ] 4c 8d 05 [ ?? ?? ?? ?? ] 48 8d 4c 24 20 41 8d 51 [ ?? ] 0f 29 74 24 20 0f 11 35 ?? ?? ?? ?? e8 [ ?? ?? ?? ?? ]"),
+        (V::A, "0f 10 05 [ ?? ?? ?? ?? ] 45 33 c9 4c 8d 05 [ ?? ?? ?? ?? ] 48 8d 4c 24 20 0f 29 44 24 20 41 8d 51 [ ?? ] e8 [ ?? ?? ?? ?? ]"),
+        (V::A, "0f 10 35 [ ?? ?? ?? ?? ] 4c 8d 05 [ ?? ?? ?? ?? ] 48 8d 4c 24 20 41 8d 51 [ ?? ] 0f 29 74 24 20 e8 [ ?? ?? ?? ?? ]"),
+        (V::B, "0f 10 05 [ ?? ?? ?? ?? ] 45 33 c9 4c 8d 05 [ ?? ?? ?? ?? ] 33 d2 48 8d 4c 24 20 0f 29 44 24 20 0f 11 05 ?? ?? ?? ?? e8 [ ?? ?? ?? ?? ]"),
+        (V::B, "0f 10 05 [ ?? ?? ?? ?? ] 45 33 c9 4c 8d 05 [ ?? ?? ?? ?? ] 33 d2 48 8d 4c 24 20 0f 29 44 24 20 e8 [ ?? ?? ?? ?? ]"),
+        (V::C, "4c 8d 05 [ ?? ?? ?? ?? ] 0f 10 35 [ ?? ?? ?? ?? ] 45 33 c9 48 8d 4c 24 20 33 d2 0f 29 74 24 20 e8 [ ?? ?? ?? ?? ]"),
+        (V::D, "48 8d 15 [ ?? ?? ?? ?? ] 0f 10 35 [ ?? ?? ?? ?? ] c7 44 24 28 ff ff ff ff 48 8d 4c 24 60 41 b9 01 00 00 00 c6 44 24 20 01 45 33 c0 e8 ?? ?? ?? ?? 4c 8b 4c 24 60 48 8d 54 24 30 41 b8 [ ?? ?? ?? ?? ]"),
+        (V::E, "48 8d 15 [ ?? ?? ?? ?? ] 0f 10 35 [ ?? ?? ?? ?? ] c7 44 24 28 ff ff ff ff 48 8d 4c 24 60 41 b9 01 00 00 00 c6 44 24 20 01 45 33 c0 e8 ?? ?? ?? ?? 4c 8b 4c 24 60 48 8d 54 24 30 45 33 c0"),
+        (V::F, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 41 b8 [ ?? ?? ?? ?? ] 48"),
+        (V::G, "0f 10 05 [ ?? ?? ?? ?? ] 41 b8 01 00 00 00 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 40 0f 29 44 24 20 e8 ?? ?? ?? ?? 45 33 c0 48 ?? ?? ?? ?? 48"),
+    ];
+    let res = join_all(
+        patterns
+            .iter()
+            .map(|(v, p)| ctx.scan_tagged(v, Pattern::new(p).unwrap())),
+    )
+    .await;
+
+    let mut versions = BTreeSet::new();
+
+    let mem = &ctx.image().memory;
+
+    for (v, pattern, addresses) in res {
+        for a in addresses {
+            let caps = mem.captures(&pattern, a)?.unwrap();
+            // println!("{caps:x?}");
+
+            match v {
+                V::A => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                        version: caps[2].data[0] as u32,
+                        name: mem.read_wstring(caps[1].rip())?,
+                    });
+                }
+                V::B => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                        version: 0,
+                        name: mem.read_wstring(caps[1].rip())?,
+                    });
+                }
+                V::C => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                        version: 0,
+                        name: mem.read_wstring(caps[0].rip())?,
+                    });
+                }
+                V::D => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                        version: caps[2].u32(),
+                        name: mem.read_wstring(caps[0].rip())?,
+                    });
+                }
+                V::E => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[1].rip()).unwrap_or_default()),
+                        version: 0,
+                        name: mem.read_wstring(caps[0].rip())?,
+                    });
+                }
+                V::F => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                        version: caps[2].u32(),
+                        name: mem.read_wstring(caps[1].rip())?,
+                    });
+                }
+                V::G => {
+                    versions.insert(CustomVersion {
+                        guid: Guid(mem.array(caps[0].rip()).unwrap_or_default()),
+                        version: 0,
+                        name: mem.read_wstring(caps[1].rip())?,
+                    });
+                }
+            }
+        }
+    }
+
+    if versions.is_empty() {
+        Err(ResolveError::new_msg("expected at least one value"))
+    } else {
+        Ok(Self(versions))
     }
 });
