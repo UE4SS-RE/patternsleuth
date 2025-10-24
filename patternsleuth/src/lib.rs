@@ -478,6 +478,7 @@ pub mod disassemble {
         Continue,
         Break,
         Exit,
+        Follow,
     }
 
     pub fn disassemble<'mem, 'img: 'mem, F>(
@@ -576,6 +577,24 @@ pub mod disassemble {
                     }
                     Control::Exit => {
                         break;
+                    }
+                    Control::Follow => {
+                        // Follow the instruction's target immediately (depth-first)
+                        let target = match ctx.instruction.flow_control() {
+                            FlowControl::Call
+                            | FlowControl::UnconditionalBranch
+                            | FlowControl::ConditionalBranch => {
+                                ctx.instruction.near_branch_target()
+                            }
+                            _ => {
+                                continue;
+                            }
+                        };
+
+                        ctx.queue.push(ctx.instruction.next_ip());
+
+                        ctx.start(target)?;
+                        continue;
                     }
                 }
             }

@@ -374,7 +374,7 @@ impl std::fmt::Debug for CustomVersion {
 impl FromStr for StaticCustomVersions {
     type Err = ResolveError;
     fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        unimplemented!()
+        Err(ResolveError::new_msg("unimplemented"))
     }
 }
 
@@ -422,7 +422,6 @@ impl_resolver!(all, StaticCustomVersions, |ctx| async {
     for (v, pattern, addresses) in res {
         for a in addresses {
             let caps = mem.captures(&pattern, a)?.unwrap();
-            // println!("{caps:x?}");
 
             match v {
                 V::A => {
@@ -483,4 +482,90 @@ impl_resolver!(all, StaticCustomVersions, |ctx| async {
     } else {
         Ok(Self(versions))
     }
+});
+
+/// Build changelist version string (e.g., "main-CL-89524" or "++UE4+Release-4.22-CL-0")
+#[derive(Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde-resolvers",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct BuildChangeList(pub String);
+
+impl FromStr for BuildChangeList {
+    type Err = ResolveError;
+    fn from_str(_s: &str) -> std::result::Result<Self, Self::Err> {
+        Err(ResolveError::new_msg("unimplemented"))
+    }
+}
+
+impl_resolver!(all, BuildChangeList, |ctx| async {
+    use crate::{
+        disassemble::{Control, disassemble},
+        resolvers::unreal::util,
+    };
+    use iced_x86::{Code, OpKind, Register};
+
+    // Pattern: call GetBuildVersion + mov r8, rax + lea rdx, [rip+"Build: %s"] + lea rcx, [rsp+offset] + call PrintfImpl
+    let patterns = [
+        "e8 [ ?? ?? ?? ?? ] 4c 8b c0 48 8d 15 [ ?? ?? ?? ?? ] 48 8d 4c 24 ?? e8",
+        "e8 [ ?? ?? ?? ?? ] 4c 8b c0 48 8d 15 [ ?? ?? ?? ?? ] 48 8d ?? ?? e8",
+    ];
+
+    // Find all "Build: %s" strings
+    let build_pattern_str = util::utf16_pattern("Build: %s");
+    let build_str_addrs: BTreeSet<_> = ctx.scan(build_pattern_str).await.into_iter().collect();
+
+    if build_str_addrs.is_empty() {
+        bail_out!("'Build: %s' string not found");
+    }
+
+    let mem = &ctx.image().memory;
+    let img = ctx.image();
+
+    let res = join_all(
+        patterns
+            .iter()
+            .map(|p| ctx.scan_tagged((), Pattern::new(p).unwrap())),
+    )
+    .await;
+
+    for (_, pattern, addresses) in res {
+        for a in addresses {
+            let caps = mem.captures(&pattern, a)?.unwrap();
+
+            // Check if caps[1] (the lea rdx offset) points to a "Build: %s" string
+            if build_str_addrs.contains(&caps[1].rip()) {
+                let call_target = caps[0].rip();
+                let mut result: Option<String> = None;
+                let mut num_inst = 0;
+
+                disassemble(img, call_target, |inst| {
+                    // Look for lea reg, [rip+offset]
+                    if matches!(inst.code(), Code::Lea_r64_m | Code::Lea_r32_m)
+                        && inst.memory_base() == Register::RIP
+                        && inst.op1_kind() == OpKind::Memory
+                        && let Ok(s) = mem.read_wstring(inst.ip_rel_memory_address())
+                    {
+                        result = Some(s);
+                        return Ok(Control::Exit);
+                    }
+
+                    num_inst += 1;
+                    if num_inst > 100 {
+                        Ok(Control::Exit)
+                    } else {
+                        // depth first
+                        Ok(Control::Follow)
+                    }
+                })?;
+
+                if let Some(s) = result {
+                    return Ok(BuildChangeList(s));
+                }
+            }
+        }
+    }
+
+    bail_out!("Build changelist not found");
 });
