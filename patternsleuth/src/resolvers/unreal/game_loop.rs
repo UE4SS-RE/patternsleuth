@@ -63,28 +63,16 @@ pub struct UGameEngineTick(pub u64);
 impl_resolver_singleton!(collect, UGameEngineTick);
 
 impl_resolver_singleton!(PEImage, UGameEngineTick, |ctx| async {
-    use crate::resolvers::Result;
-    use patternsleuth_scanner::Pattern;
+    let strings = ["causeevent=\0", "CAUSEEVENT \0"];
+    let strings: Vec<_> = join_all(strings.map(|s| ctx.scan(util::utf16_pattern(s))))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
 
-    let strings = ctx
-        .scan(Pattern::from_bytes(b"EngineTickMisc\x00".to_vec()).unwrap())
-        .await;
+    let refs = util::scan_xrefs(ctx, &strings).await;
 
-    let refs = join_all(
-        strings
-            .iter()
-            // TODO maybe mask out specific register
-            .map(|s| ctx.scan(Pattern::new(format!("48 8d 0d X0x{s:X}")).unwrap())),
-    )
-    .await;
-
-    let fns = refs
-        .into_iter()
-        .flatten()
-        .map(|r| -> Result<_> { Ok(ctx.image().get_root_function(r)?.map(|f| f.range.start)) })
-        .collect::<Result<Vec<_>>>()? // TODO avoid this collect?
-        .into_iter()
-        .flatten();
+    let fns = util::root_functions(ctx, &refs)?;
 
     Ok(UGameEngineTick(ensure_one(fns)?))
 });
